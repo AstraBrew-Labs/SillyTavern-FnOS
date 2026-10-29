@@ -1,0 +1,24 @@
+#!/bin/bash
+### 安装前置检查：本应用强依赖 Node.js 22 运行时（manifest.install_dep_apps=nodejs_v22:git）
+
+export PATH="/var/apps/nodejs_v22/target/bin:$PATH"
+
+USER_MSG_FILE="${TRIM_TEMP_LOGFILE:-/dev/null}"
+
+if ! command -v node >/dev/null 2>&1; then
+    printf '%s\n' "未检测到 Node.js 运行时。请确认依赖应用 nodejs_v22 已安装并处于启用状态后重试。" > "${USER_MSG_FILE}"
+    exit 1
+fi
+
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)"
+if [ "${NODE_MAJOR:-0}" -lt 22 ]; then
+    printf '%s\n' "当前 Node.js 主版本为 ${NODE_MAJOR}，SillyTavern 需要 Node.js 22，请启用 nodejs_v22 依赖后重试。" > "${USER_MSG_FILE}"
+    exit 1
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+    printf '%s\n' "未检测到 npm，nodejs_v22 运行时不完整，请重新安装该依赖应用。" > "${USER_MSG_FILE}"
+    exit 1
+fi
+
+exit 0

@@ -1,0 +1,14 @@
+[
+  {
+    "stepTitle": "数据保留",
+    "items": [
+      {
+        "type": "switch",
+        "field": "wizard_keep_data",
+        "label": "保留聊天记录与角色卡",
+        "initValue": "true",
+        "helpText": "开启后，卸载只删除程序文件，共享目录中的聊天记录、角色卡与预设会保留，重新安装后可继续使用。关闭将永久删除这些数据，且无法恢复。"
+      }
+    ]
+  }
+]

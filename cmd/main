@@ -1,0 +1,317 @@
+#!/bin/bash
+### 生命周期脚本：start / stop / status
+### SillyTavern 由上游 server.js 直接提供 HTTP 服务，本脚本负责运行时环境注入、
+### 启动前配置同步、数据目录自愈与进程管理。
+
+export PATH="/var/apps/nodejs_v22/target/bin:$PATH"
+
+ST_HOME="${TRIM_PKGVAR}/sillytavern"
+LOG_DIR="${TRIM_PKGVAR}/logs"
+LOG_FILE="${LOG_DIR}/app.log"
+PID_FILE="${TRIM_PKGVAR}/app.pid"
+CFG_FILE="${ST_HOME}/config.yaml"
+PATCHER="${TRIM_APPDEST}/server/patch-config.js"
+USER_MSG_FILE="${TRIM_TEMP_LOGFILE:-/dev/null}"
+
+SHARE_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+[ -n "${SHARE_DIR}" ] || SHARE_DIR="${TRIM_APPDEST}/../shares/sillytavern"
+SHARE_DATA="${SHARE_DIR}/data"
+
+# 端口解析顺序：向导变量 -> config.yaml 中已生效的值 -> manifest.service_port -> 默认 11451。
+# 上游默认 8000 视为「未设置」，迁移到本应用规定的 11451。
+# 必须与 app/ui/config 的 ${wizard_port} 一致，否则入口会指向没人监听的端口。
+resolve_port() {
+    local value="${wizard_port:-}"
+    if [ -z "${value}" ] && [ -f "${CFG_FILE}" ]; then
+        value="$(awk '/^port:[[:space:]]*[0-9]+[[:space:]]*$/{print $2; exit}' "${CFG_FILE}" | tr -d "\"'")"
+    fi
+    if [ "${value}" = "8000" ]; then
+        value=""
+    fi
+    [ -n "${value}" ] || value="${TRIM_SERVICE_PORT:-11451}"
+    printf '%s' "${value}"
+}
+
+# 内核启用 IPv6 栈才开启双栈监听，否则绑定 [::] 会直接让进程退出
+detect_ipv6() {
+    if [ -s /proc/net/if_inet6 ]; then
+        printf 'true'
+    else
+        printf 'false'
+    fi
+}
+
+PORT="$(resolve_port)"
+IPV6_ENABLED="$(detect_ipv6)"
+
+export HOME="${TRIM_PKGHOME:-${ST_HOME}}"
+export npm_config_cache="${TRIM_PKGVAR}/.npm"
+export npm_config_update_notifier=false
+
+mkdir -p "${LOG_DIR}" 2>/dev/null
+
+log_msg() { printf '%s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "${LOG_FILE}"; }
+alive() { kill -0 "$1" 2>/dev/null; }
+
+# SillyTavern 安装扩展/插件时会调用系统 git（simple-git -> spawn git），
+# 进程里拿不到 git 或拿不到 git 的 exec-path 都会让接口返回 500。
+# fnOS 的 Git 应用另一处已知坑：PATH 里没有 git-core 时
+# `git clone https://...` 会报 "git: 'remote-https' is not a git command"。
+resolve_git() {
+    local bin candidate
+    bin="$(command -v git 2>/dev/null)"
+    if [ -z "${bin}" ]; then
+        for candidate in \
+            /var/apps/git/target/bin/git \
+            /var/packages/git/target/bin/git \
+            /usr/local/bin/git \
+            /usr/bin/git; do
+            if [ -x "${candidate}" ]; then
+                bin="${candidate}"
+                break
+            fi
+        done
+    fi
+    printf '%s' "${bin}"
+}
+
+GIT_BIN="$(resolve_git)"
+
+configure_git() {
+    [ -n "${GIT_BIN}" ] || return 0
+
+    export PATH="$(dirname "${GIT_BIN}"):${PATH}"
+
+    local exec_path
+    exec_path="$("${GIT_BIN}" --exec-path 2>/dev/null)"
+    if [ -n "${exec_path}" ] && [ -d "${exec_path}" ]; then
+        export GIT_EXEC_PATH="${exec_path}"
+        case ":${PATH}:" in
+            *":${exec_path}:"*) ;;
+            *) export PATH="${PATH}:${exec_path}" ;;
+        esac
+    elif [ -d /usr/lib/git-core ]; then
+        export GIT_EXEC_PATH="/usr/lib/git-core"
+        case ":${PATH}:" in
+            *":/usr/lib/git-core:"*) ;;
+            *) export PATH="${PATH}:/usr/lib/git-core" ;;
+        esac
+    fi
+
+    # 源码目录可能由安装流程以 root 写入，git 会因属主不一致拒绝操作
+    local dir
+    for dir in "${ST_HOME}" "${ST_HOME}/public/scripts/extensions/third-party"; do
+        [ -d "${dir}" ] || continue
+        if ! "${GIT_BIN}" config --global --get-all safe.directory 2>/dev/null | grep -qxF "${dir}"; then
+            "${GIT_BIN}" config --global --add safe.directory "${dir}" >> "${LOG_FILE}" 2>&1
+        fi
+    done
+
+    local git_ver
+    git_ver="$("${GIT_BIN}" --version 2>/dev/null | awk '{print $3}')"
+    log_msg "git: ${GIT_BIN} (v${git_ver}, exec-path=${GIT_EXEC_PATH:-default})"
+}
+
+configure_git
+
+if [ -z "${GIT_BIN}" ]; then
+    log_msg "未找到 git：SillyTavern 安装扩展/插件会失败，请在应用中心安装 Git 依赖"
+fi
+
+read_pid() {
+    [ -r "${PID_FILE}" ] || return 1
+    head -n 1 "${PID_FILE}" | tr -d '[:space:]'
+}
+
+status_app() {
+    local pid
+    pid="$(read_pid)" || return 1
+    [ -n "${pid}" ] || return 1
+    if alive "${pid}"; then
+        return 0
+    fi
+    rm -f "${PID_FILE}"
+    return 1
+}
+
+# 数据目录始终指向应用共享目录，保证升级/重装后聊天记录与角色卡不丢
+ensure_data_link() {
+    mkdir -p "${SHARE_DATA}" 2>/dev/null
+    if [ -L "${ST_HOME}/data" ]; then
+        return 0
+    fi
+    if [ -d "${ST_HOME}/data" ] && [ -n "$(ls -A "${ST_HOME}/data" 2>/dev/null)" ]; then
+        log_msg "检测到本地 data 目录，迁移至共享目录"
+        cp -a "${ST_HOME}/data/." "${SHARE_DATA}/" >> "${LOG_FILE}" 2>&1
+    fi
+    rm -rf "${ST_HOME}/data"
+    ln -sfn "${SHARE_DATA}" "${ST_HOME}/data"
+    log_msg "data 目录已链接到 ${SHARE_DATA}"
+}
+
+ensure_dependencies() {
+    [ -d "${ST_HOME}/node_modules" ] && return 0
+    log_msg "node_modules 缺失，尝试补装依赖"
+    ( cd "${ST_HOME}" && npm install --omit=dev --no-audit --no-fund --loglevel=error \
+        --registry https://registry.npmmirror.com ) >> "${LOG_FILE}" 2>&1
+}
+
+# 每次启动前强制同步运行配置：
+# 1) config.yaml 必须是实体文件——旧版本用软链指到 etc，SillyTavern 重写配置时会把软链
+#    替换成实体文件，之后所有改写都落在失效的副本上（表现为端口改不动、一直是 8000）。
+# 2) 键值全部显式写入，避免继承上游默认值（8000 / listen=false / whitelist 仅本机）。
+#    白名单常开且内含 0.0.0.0/0 与 ::/0，等效全放行，同时满足 SillyTavern 的安全门槛。
+ensure_runtime_config() {
+    if [ -L "${CFG_FILE}" ]; then
+        local target
+        target="$(readlink "${CFG_FILE}")"
+        rm -f "${CFG_FILE}"
+        if [ -f "${target}" ]; then
+            cp -f "${target}" "${CFG_FILE}"
+        fi
+        log_msg "config.yaml 由软链迁移为实体文件（原指向 ${target}）"
+    fi
+
+    if [ ! -f "${CFG_FILE}" ]; then
+        if [ -f "${ST_HOME}/default/config.yaml" ]; then
+            cp -f "${ST_HOME}/default/config.yaml" "${CFG_FILE}"
+            log_msg "config.yaml 缺失，已从上游默认配置生成"
+        else
+            : > "${CFG_FILE}"
+            log_msg "config.yaml 缺失且无上游默认模板，已创建空配置"
+        fi
+    fi
+
+    if ! command -v node >/dev/null 2>&1 || [ ! -f "${PATCHER}" ]; then
+        log_msg "缺少 node 或 ${PATCHER}，无法同步运行配置"
+        return 1
+    fi
+
+    if node "${PATCHER}" "${CFG_FILE}" \
+        "port=!${PORT}" \
+        "listen=!true" \
+        "listenAddress.ipv4=0.0.0.0" \
+        "listenAddress.ipv6=[::]" \
+        "protocol.ipv4=!true" \
+        "protocol.ipv6=!${IPV6_ENABLED}" \
+        "whitelistMode=!true" \
+        "whitelist[]=127.0.0.1,::1,0.0.0.0/0,::/0" \
+        "basicAuthMode=!false" \
+        "browserLaunch.enabled=!false" \
+        "dataRoot=${SHARE_DATA}" >> "${LOG_FILE}" 2>&1; then
+        log_msg "启动前已同步配置：port=${PORT} listen=0.0.0.0 ipv6=${IPV6_ENABLED} whitelist=open"
+        return 0
+    fi
+
+    log_msg "启动前同步配置失败，继续以命令行参数启动"
+    return 1
+}
+
+port_listening() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null || return 1
+    exec 3<&- 3>&- 2>/dev/null
+    return 0
+}
+
+# 启动失败时把真实原因回显到应用中心，避免只看到「执行启动脚本失败」
+report_failure() {
+    local tail_log
+    tail_log="$(tail -n 25 "${LOG_FILE}" 2>/dev/null | tr -d '\r')"
+    printf '%s\n%s\n' "${1}" "${tail_log}" > "${USER_MSG_FILE}"
+}
+
+start_app() {
+    if status_app; then
+        log_msg "服务已在运行，跳过启动"
+        return 0
+    fi
+
+    if [ ! -f "${ST_HOME}/server.js" ]; then
+        log_msg "ERROR: ${ST_HOME}/server.js 不存在"
+        report_failure "SillyTavern 尚未完成部署，请在应用中心重新安装该应用。"
+        return 1
+    fi
+
+    ensure_data_link
+    ensure_dependencies || log_msg "依赖补装失败，仍尝试启动"
+    ensure_runtime_config || log_msg "配置同步失败，继续以命令行参数启动"
+
+    cd "${ST_HOME}" || return 1
+    log_msg "===== 启动（node $(node -v 2>/dev/null) / port=${PORT}）====="
+    node server.js --port "${PORT}" >> "${LOG_FILE}" 2>&1 &
+    local pid=$!
+    printf '%s' "${pid}" > "${PID_FILE}"
+
+    # 最多等 25 秒：进程退出即失败；端口可连即成功
+    local waited=0
+    while [ "${waited}" -lt 25 ]; do
+        if ! alive "${pid}"; then
+            log_msg "进程在启动阶段退出（${waited}s）"
+            rm -f "${PID_FILE}"
+            report_failure "SillyTavern 启动失败（进程已退出），日志末尾如下："
+            return 1
+        fi
+        if port_listening "${PORT}"; then
+            log_msg "启动成功（pid=${pid}, port=${PORT}, ${waited}s）"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    log_msg "25 秒内未监听 ${PORT}，进程仍在运行，按成功处理"
+    return 0
+}
+
+stop_app() {
+    local pid count
+    pid="$(read_pid)" || { rm -f "${PID_FILE}"; return 0; }
+    [ -n "${pid}" ] || { rm -f "${PID_FILE}"; return 0; }
+
+    if ! alive "${pid}"; then
+        rm -f "${PID_FILE}"
+        log_msg "进程已不存在，清理 pid 文件"
+        return 0
+    fi
+
+    log_msg "发送 TERM 信号至 PID:${pid}"
+    kill -TERM "${pid}" 2>> "${LOG_FILE}"
+
+    count=0
+    while alive "${pid}" && [ "${count}" -lt 10 ]; do
+        sleep 1
+        count=$((count + 1))
+    done
+
+    if alive "${pid}"; then
+        log_msg "发送 KILL 信号至 PID:${pid}"
+        kill -KILL "${pid}" 2>> "${LOG_FILE}"
+        sleep 1
+    fi
+
+    rm -f "${PID_FILE}"
+    log_msg "服务已停止"
+    return 0
+}
+
+case "$1" in
+start)
+    start_app
+    exit $?
+    ;;
+stop)
+    stop_app
+    exit $?
+    ;;
+status)
+    if status_app; then
+        exit 0
+    fi
+    exit 3
+    ;;
+*)
+    log_msg "未知指令：$1"
+    printf '%s\n' "未知指令：$1" > "${USER_MSG_FILE}"
+    exit 1
+    ;;
+esac

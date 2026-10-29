@@ -1,0 +1,22 @@
+appname=sillytavern
+version=1.19.0-2
+display_name=SillyTavern
+desc=为高级用户打造的 LLM 前端界面
+source=thirdparty
+platform=all
+
+maintainer=SillyTavern
+maintainer_url=https://github.com/SillyTavern/SillyTavern
+distributor=AstraBrew Labs
+distributor_url=https://astrabrew.cn
+
+os_min_version=1.1.3100
+
+checkport=false
+ctl_stop=true
+install_dep_apps=nodejs_v22:git
+
+desktop_uidir=ui
+desktop_applaunchname=sillytavern.Application
+
+changelog=1.19.0-2：修复安装扩展报 500——启动时注入 git 与 git-core 到进程环境

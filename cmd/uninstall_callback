@@ -1,0 +1,38 @@
+#!/bin/bash
+### 卸载后：清理应用文件；用户数据按向导选择（wizard_keep_data）。
+### 共享目录只会删除本应用自己的路径，且带路径校验。
+
+ST_HOME="${TRIM_PKGVAR}/sillytavern"
+LOG_FILE="${TRIM_PKGVAR}/logs/install.log"
+KEEP_DATA="${wizard_keep_data:-true}"
+
+SHARE_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+[ -n "${SHARE_DIR}" ] || SHARE_DIR="${TRIM_APPDEST}/../shares/sillytavern"
+
+log() { printf '%s [uninstall] %s\n' "$(date '+%F %T')" "$*" >> "${LOG_FILE}"; }
+
+log "开始清理（keep_data=${KEEP_DATA}）"
+
+# 先解除指向共享目录的符号链接，避免误删用户数据
+if [ -L "${ST_HOME}/data" ]; then
+    rm -f "${ST_HOME}/data"
+fi
+
+rm -rf "${ST_HOME}"
+log "已移除应用源码目录"
+
+if [ "${KEEP_DATA}" = "true" ]; then
+    log "按选择保留用户数据：${SHARE_DIR}"
+else
+    case "${SHARE_DIR}" in
+        */sillytavern | */sillytavern/)
+            rm -rf "${SHARE_DIR:?}/data" "${SHARE_DIR:?}/config" 2>/dev/null
+            log "已删除用户数据目录下的 data 与 config"
+            ;;
+        *)
+            log "共享目录路径不在预期范围内，跳过删除：${SHARE_DIR}"
+            ;;
+    esac
+fi
+
+exit 0

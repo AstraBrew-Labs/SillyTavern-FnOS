@@ -1,0 +1,24 @@
+[
+  {
+    "stepTitle": "服务端口",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_port",
+        "label": "服务端口（默认 11451）",
+        "initValue": "11451",
+        "helpText": "修改后服务会重启。监听地址固定 0.0.0.0，白名单常开且全放行，不做账号鉴权。",
+        "rules": [
+          {
+            "required": true,
+            "message": "请填写服务端口"
+          },
+          {
+            "pattern": "^[0-9]{4,5}$",
+            "message": "端口需为 4-5 位数字"
+          }
+        ]
+      }
+    ]
+  }
+]

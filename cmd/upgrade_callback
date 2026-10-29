@@ -1,0 +1,28 @@
+#!/bin/bash
+### 升级后：把上游源码同步到本包声明的版本（版本比对在 install_callback 内完成）。
+### 端口、监听、白名单等运行配置保存在 config.yaml，升级流程不写端口，避免覆盖用户设置。
+### 整个升级过程不需要任何向导输入。
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR="${TRIM_PKGVAR}/logs"
+LOG_FILE="${LOG_DIR}/install.log"
+
+mkdir -p "${LOG_DIR}" 2>/dev/null
+
+log() { printf '%s [upgrade] %s\n' "$(date '+%F %T')" "$*" >> "${LOG_FILE}"; }
+
+log "===== 升级后处理（${TRIM_OLD_APPVER:-?} -> ${TRIM_APPVER:-?}）====="
+
+# ST_FORCE_UPDATE=1 让 install_callback 比对已部署版本与目标版本；
+# 不传任何向导变量，端口与配置一律沿用 config.yaml 现值。
+ST_FORCE_UPDATE=1 bash "${SELF_DIR}/install_callback" >> "${LOG_FILE}" 2>&1
+RC=$?
+
+if [ "${RC}" -ne 0 ]; then
+    # 源码同步失败不影响已有部署：保留旧版本继续运行，错误已写入 TRIM_TEMP_LOGFILE
+    log "源码同步失败（退出码 ${RC}），沿用现有部署"
+else
+    log "源码同步完成"
+fi
+
+exit 0

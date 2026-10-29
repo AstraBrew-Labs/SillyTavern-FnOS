@@ -1,0 +1,12 @@
+#!/bin/bash
+### 升级前：停止服务，避免升级期间文件被占用
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_FILE="${TRIM_PKGVAR}/logs/install.log"
+
+log() { printf '%s [upgrade_init] %s\n' "$(date '+%F %T')" "$*" >> "${LOG_FILE}"; }
+
+log "升级前停止服务（${TRIM_OLD_APPVER:-?} -> ${TRIM_APPVER:-?}）"
+bash "${SELF_DIR}/main" stop >> "${LOG_FILE}" 2>&1
+
+exit 0

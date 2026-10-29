@@ -1,0 +1,17 @@
+#!/bin/bash
+### 卸载前：停止服务
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_FILE="${TRIM_PKGVAR}/logs/install.log"
+
+log() { printf '%s [uninstall_init] %s\n' "$(date '+%F %T')" "$*" >> "${LOG_FILE}"; }
+
+log "卸载前停止服务"
+
+if [ "$(id -u)" = "0" ] && [ -n "${TRIM_USERNAME:-}" ] && command -v runuser >/dev/null 2>&1; then
+    runuser -u "${TRIM_USERNAME}" -- bash "${SELF_DIR}/main" stop >> "${LOG_FILE}" 2>&1
+else
+    bash "${SELF_DIR}/main" stop >> "${LOG_FILE}" 2>&1
+fi
+
+exit 0

@@ -1,0 +1,332 @@
+#!/bin/bash
+### 安装完成后初始化：拉取 SillyTavern 上游源码、安装依赖、生成访问配置。
+### 必须可重复执行：重装 / 修复 / 升级后再次调用时，不得破坏已有数据与配置。
+
+# 与上游 SillyTavern 官方版本号保持一致；升级本应用即把源码换到该标签
+ST_VERSION="1.19.0"
+ST_FALLBACK_BRANCH="release" # 标签获取失败时的兜底分支
+ST_REPO="https://github.com/SillyTavern/SillyTavern.git"
+
+ST_HOME="${TRIM_PKGVAR}/sillytavern"
+LOG_DIR="${TRIM_PKGVAR}/logs"
+LOG_FILE="${LOG_DIR}/install.log"
+CFG_FILE="${ST_HOME}/config.yaml"
+PATCHER="${TRIM_APPDEST}/server/patch-config.js"
+VERSION_FILE="${TRIM_PKGVAR}/sillytavern.version"
+USER_MSG_FILE="${TRIM_TEMP_LOGFILE:-/dev/null}"
+
+# 端口解析顺序：向导变量 -> config.yaml 中已生效的值 -> manifest.service_port -> 默认 11451。
+# 重装/修复流程通常不带向导变量，此时必须沿用既有端口，否则会把用户设过的端口重置。
+resolve_port() {
+    local value="${wizard_port:-}"
+    if [ -z "${value}" ] && [ -f "${CFG_FILE}" ]; then
+        value="$(awk '/^port:[[:space:]]*[0-9]+[[:space:]]*$/{print $2; exit}' "${CFG_FILE}" | tr -d "\"'")"
+    fi
+    [ -n "${value}" ] || value="${TRIM_SERVICE_PORT:-11451}"
+    printf '%s' "${value}"
+}
+
+PORT="$(resolve_port)"
+
+# 内核启用 IPv6 栈才开启双栈监听，否则绑定 [::] 会让进程直接退出
+if [ -s /proc/net/if_inet6 ]; then
+    IPV6_ENABLED="true"
+else
+    IPV6_ENABLED="false"
+fi
+
+CLONE_URLS=(
+    "${ST_REPO}"
+    "https://ghfast.top/${ST_REPO}"
+    "https://gh-proxy.org/${ST_REPO}"
+    "https://gt.astrabrew.cn/${ST_REPO}"
+)
+
+TARBALL_BASES=(
+    "https://codeload.github.com/SillyTavern/SillyTavern/tar.gz"
+    "https://ghfast.top/https://codeload.github.com/SillyTavern/SillyTavern/tar.gz"
+    "https://gh-proxy.org/https://codeload.github.com/SillyTavern/SillyTavern/tar.gz"
+)
+
+NPM_REGISTRIES=("https://registry.npmmirror.com" "https://registry.npmjs.org")
+
+SHARE_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+[ -n "${SHARE_DIR}" ] || SHARE_DIR="${TRIM_APPDEST}/../shares/sillytavern"
+SHARE_DATA="${SHARE_DIR}/data"
+
+export PATH="/var/apps/nodejs_v22/target/bin:${PATH}"
+export HOME="${TRIM_PKGHOME:-${ST_HOME}}"
+export TMPDIR="${TRIM_PKGTMP:-/tmp}"
+export npm_config_cache="${TRIM_PKGVAR}/.npm"
+export npm_config_update_notifier=false
+export npm_config_fund=false
+export npm_config_audit=false
+
+mkdir -p "${LOG_DIR}" "${ST_HOME}" "${TMPDIR}" 2>/dev/null
+
+log() { printf '%s [install] %s\n' "$(date '+%F %T')" "$*" >> "${LOG_FILE}"; }
+
+fail() {
+    log "ERROR: $*"
+    printf '%s\n' "$*" > "${USER_MSG_FILE}"
+    exit 1
+}
+
+# 运行时与工具链定位 -----------------------------------------------------------
+
+GIT_BIN="$(command -v git 2>/dev/null)"
+if [ -z "${GIT_BIN}" ]; then
+    for candidate in \
+        /var/apps/git/target/bin/git \
+        /var/packages/git/target/bin/git \
+        /usr/local/bin/git \
+        /usr/bin/git; do
+        if [ -x "${candidate}" ]; then
+            GIT_BIN="${candidate}"
+            break
+        fi
+    done
+fi
+
+if [ -n "${GIT_BIN}" ]; then
+    export PATH="$(dirname "${GIT_BIN}"):${PATH}"
+    if [ -d /usr/lib/git-core ]; then
+        export GIT_EXEC_PATH="/usr/lib/git-core"
+    fi
+    log "git 可用：$("${GIT_BIN}" --version 2>&1)"
+else
+    log "未检测到 git 命令，将退化为直接下载源码压缩包"
+fi
+
+# 源码获取 ---------------------------------------------------------------------
+
+# 把解压/克隆结果换入 ST_HOME，同时保住用户配置与数据目录
+swap_in() {
+    local incoming="$1" desc="$2" backup=""
+    if [ -f "${CFG_FILE}" ]; then
+        backup="${TRIM_PKGVAR}/config.yaml.keep"
+        cp -f "${CFG_FILE}" "${backup}"
+    fi
+
+    rm -rf "${ST_HOME}"
+    mv "${incoming}" "${ST_HOME}"
+
+    if [ -n "${backup}" ] && [ -f "${backup}" ]; then
+        cp -f "${backup}" "${CFG_FILE}"
+        rm -f "${backup}"
+        log "已还原用户配置 config.yaml"
+    fi
+
+    ensure_data_dir
+    log "源码就位：${desc}"
+}
+
+clone_source() {
+    local ref="$1" url
+    for url in "${CLONE_URLS[@]}"; do
+        log "git clone ${url} (ref=${ref})"
+        rm -rf "${ST_HOME}.incoming"
+        if "${GIT_BIN}" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=90 \
+            clone --depth 1 --single-branch --branch "${ref}" \
+            "${url}" "${ST_HOME}.incoming" >> "${LOG_FILE}" 2>&1; then
+            swap_in "${ST_HOME}.incoming" "${url} (${ref})"
+            return 0
+        fi
+        log "git clone 失败：${url} (ref=${ref})"
+    done
+    rm -rf "${ST_HOME}.incoming"
+    return 1
+}
+
+download_source() {
+    local ref="$1" base url archive="${TMPDIR}/sillytavern-src.tar.gz"
+    local workdir="${TMPDIR}/sillytavern-src" extracted
+
+    for base in "${TARBALL_BASES[@]}"; do
+        url="${base}/refs/tags/${ref}"
+        log "下载源码压缩包 ${url}"
+        rm -rf "${workdir}"
+        mkdir -p "${workdir}"
+
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --connect-timeout 20 --retry 2 -o "${archive}" "${url}" >> "${LOG_FILE}" 2>&1 || continue
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -T 20 -O "${archive}" "${url}" >> "${LOG_FILE}" 2>&1 || continue
+        else
+            log "缺少 curl / wget，无法下载源码压缩包"
+            return 1
+        fi
+
+        tar -xzf "${archive}" -C "${workdir}" >> "${LOG_FILE}" 2>&1 || continue
+        extracted="$(find "${workdir}" -maxdepth 1 -mindepth 1 -type d | head -n 1)"
+
+        if [ -z "${extracted}" ] || [ ! -f "${extracted}/server.js" ]; then
+            log "源码压缩包内容异常：${url}"
+            continue
+        fi
+
+        swap_in "${extracted}" "${url}"
+        rm -rf "${workdir}" "${archive}"
+        return 0
+    done
+
+    rm -rf "${workdir}" "${archive}"
+    return 1
+}
+
+# 先按固定标签取，失败再退到 release 分支（保证仍可安装，但记录实际来源）
+deploy_source() {
+    local ref
+    for ref in "${ST_VERSION}" "${ST_FALLBACK_BRANCH}"; do
+        if [ -n "${GIT_BIN}" ] && clone_source "${ref}"; then
+            printf '%s' "${ref}" > "${TRIM_PKGVAR}/sillytavern.ref"
+            return 0
+        fi
+        if download_source "${ref}"; then
+            printf '%s' "${ref}" > "${TRIM_PKGVAR}/sillytavern.ref"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 依赖安装 ---------------------------------------------------------------------
+
+install_dependencies() {
+    local registry
+    for registry in "${NPM_REGISTRIES[@]}"; do
+        log "npm install（registry=${registry}）"
+        if ( cd "${ST_HOME}" && npm install --omit=dev --no-audit --no-fund \
+            --loglevel=error --registry "${registry}" >> "${LOG_FILE}" 2>&1 ); then
+            log "依赖安装完成（registry=${registry}）"
+            return 0
+        fi
+        log "依赖安装失败（registry=${registry}）"
+    done
+    return 1
+}
+
+# 数据目录 ---------------------------------------------------------------------
+
+ensure_data_dir() {
+    mkdir -p "${SHARE_DATA}" >> "${LOG_FILE}" 2>&1
+
+    if [ -L "${ST_HOME}/data" ]; then
+        if [ "$(readlink "${ST_HOME}/data")" = "${SHARE_DATA}" ]; then
+            return 0
+        fi
+        rm -f "${ST_HOME}/data"
+    elif [ -d "${ST_HOME}/data" ]; then
+        if [ -n "$(ls -A "${ST_HOME}/data" 2>/dev/null)" ]; then
+            log "迁移已有 data 目录至共享目录"
+            cp -a "${ST_HOME}/data/." "${SHARE_DATA}/" >> "${LOG_FILE}" 2>&1
+        fi
+        rm -rf "${ST_HOME}/data"
+    fi
+
+    ln -sfn "${SHARE_DATA}" "${ST_HOME}/data"
+    log "data 目录已链接：${ST_HOME}/data -> ${SHARE_DATA}"
+}
+
+# 访问配置 ---------------------------------------------------------------------
+# 监听 0.0.0.0 并开启 IPv4/IPv6 双栈；不做账号鉴权。
+# 白名单常开但内含 0.0.0.0/0 与 ::/0（等效全放行）——SillyTavern 在 listen=true 且
+# 白名单/鉴权全关时会直接 process.exit(1)，常开白名单是既能全放行又能启动的写法。
+
+validate_port() {
+    case "${PORT}" in
+        '' | *[!0-9]*) fail "服务端口必须为数字，请填写 5000-65535 之间的端口。" ;;
+    esac
+
+    if [ "${PORT}" -lt 5000 ] || [ "${PORT}" -gt 65535 ]; then
+        fail "服务端口需在 5000-65535 之间，当前填写：${PORT}。"
+    fi
+}
+
+write_config() {
+    local args
+
+    # 配置存放于应用目录内，与 SillyTavern 读写的文件是同一个实体文件
+    if [ ! -f "${CFG_FILE}" ]; then
+        if [ -f "${ST_HOME}/default/config.yaml" ]; then
+            cp -f "${ST_HOME}/default/config.yaml" "${CFG_FILE}"
+        else
+            : > "${CFG_FILE}"
+        fi
+        log "已生成配置文件 ${CFG_FILE}"
+    fi
+
+    args=(
+        "port=!${PORT}"
+        "listen=!true"
+        "listenAddress.ipv4=0.0.0.0"
+        "listenAddress.ipv6=[::]"
+        "protocol.ipv4=!true"
+        "protocol.ipv6=!${IPV6_ENABLED}"
+        "whitelistMode=!true"
+        "whitelist[]=127.0.0.1,::1,0.0.0.0/0,::/0"
+        "basicAuthMode=!false"
+        "browserLaunch.enabled=!false"
+        "dataRoot=${SHARE_DATA}"
+    )
+
+    if [ -x "$(command -v node)" ] && [ -f "${PATCHER}" ]; then
+        if node "${PATCHER}" "${CFG_FILE}" "${args[@]}" >> "${LOG_FILE}" 2>&1; then
+            log "运行配置已写入（port=${PORT}, listen=0.0.0.0, ipv6=on）"
+        else
+            log "访问配置写入失败，请检查 ${CFG_FILE}"
+        fi
+    else
+        log "跳过配置写入：未找到 node 或 ${PATCHER}"
+    fi
+
+}
+
+# 属主修复（安装流程可能以 root 执行）------------------------------------------
+
+fix_ownership() {
+    if [ "$(id -u)" = "0" ] && [ -n "${TRIM_UID:-}" ] && [ -n "${TRIM_GID:-}" ]; then
+        chown -R "${TRIM_UID}:${TRIM_GID}" "$@" >> "${LOG_FILE}" 2>&1 || log "属主修复部分失败（可忽略）"
+    fi
+}
+
+# 主流程 -----------------------------------------------------------------------
+
+log "===== 开始部署 SillyTavern（应用版本 ${TRIM_APPVER:-unknown}）====="
+log "ST_HOME=${ST_HOME} PORT=${PORT} DATA=${SHARE_DATA}"
+
+# 是否需要（重新）部署源码：首次安装，或升级时目标版本与已部署版本不一致
+DEPLOYED_VERSION="$(head -n 1 "${VERSION_FILE}" 2>/dev/null | tr -d '[:space:]')"
+NEED_DEPLOY=0
+
+if [ ! -f "${ST_HOME}/server.js" ]; then
+    NEED_DEPLOY=1
+    log "未检测到已部署源码，开始部署 ${ST_VERSION}"
+elif [ "${ST_FORCE_UPDATE:-0}" = "1" ] && [ "${DEPLOYED_VERSION}" != "${ST_VERSION}" ]; then
+    NEED_DEPLOY=1
+    log "版本变更 ${DEPLOYED_VERSION:-未知} -> ${ST_VERSION}，重新部署源码（保留配置与数据）"
+elif [ "${ST_FORCE_UPDATE:-0}" = "1" ]; then
+    log "已部署版本 ${DEPLOYED_VERSION} 与目标一致，跳过源码更新"
+fi
+
+if [ "${NEED_DEPLOY}" = "1" ]; then
+    deploy_source || fail "SillyTavern 源码获取失败（目标版本 ${ST_VERSION}）。请确认 NAS 可以访问外网后重试，详细日志：${LOG_FILE}"
+fi
+
+if [ -d "${ST_HOME}/node_modules" ]; then
+    log "检测到已安装的依赖，跳过 npm install"
+else
+    install_dependencies || fail "Node 依赖安装失败。请检查 NAS 网络与 npm 源可用性后重试，详细日志：${LOG_FILE}"
+fi
+
+ensure_data_dir
+validate_port
+write_config
+
+printf '%s\n' "${ST_VERSION}" > "${VERSION_FILE}"
+log "应用版本：${ST_VERSION}（源码来源 $(cat "${TRIM_PKGVAR}/sillytavern.ref" 2>/dev/null || echo "${ST_VERSION}")）"
+
+fix_ownership "${ST_HOME}" "${LOG_DIR}" "${CFG_FILE}" "${TRIM_PKGVAR}/.npm" "${SHARE_DATA}"
+
+log "===== 部署完成 ====="
+exit 0

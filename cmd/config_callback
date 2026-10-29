@@ -1,0 +1,88 @@
+#!/bin/bash
+### 配置变更后：写入服务端口并重启服务
+### 监听地址、白名单、鉴权等策略固定（0.0.0.0 + IPv4/IPv6 双栈、无白名单、无鉴权），
+### 每次启动前由 cmd/main 再次强制同步，避免上游默认值覆盖。
+
+export PATH="/var/apps/nodejs_v22/target/bin:$PATH"
+
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+ST_HOME="${TRIM_PKGVAR}/sillytavern"
+LOG_DIR="${TRIM_PKGVAR}/logs"
+LOG_FILE="${LOG_DIR}/install.log"
+CFG_FILE="${ST_HOME}/config.yaml"
+PATCHER="${TRIM_APPDEST}/server/patch-config.js"
+
+# 端口解析顺序：向导变量 -> config.yaml 中已生效的值 -> manifest.service_port -> 默认 11451
+resolve_port() {
+    local value="${wizard_port:-}"
+    if [ -z "${value}" ] && [ -f "${CFG_FILE}" ]; then
+        value="$(awk '/^port:[[:space:]]*[0-9]+[[:space:]]*$/{print $2; exit}' "${CFG_FILE}" | tr -d "\"'")"
+    fi
+    # 上游默认端口 8000 视为「未设置」，迁移到本应用规定的 11451
+    if [ "${value}" = "8000" ]; then
+        value=""
+    fi
+    [ -n "${value}" ] || value="${TRIM_SERVICE_PORT:-11451}"
+    printf '%s' "${value}"
+}
+
+PORT="$(resolve_port)"
+
+# 内核启用 IPv6 栈才开启双栈监听，否则绑定 [::] 会让进程直接退出
+if [ -s /proc/net/if_inet6 ]; then
+    IPV6_ENABLED="true"
+else
+    IPV6_ENABLED="false"
+fi
+
+mkdir -p "${LOG_DIR}" 2>/dev/null
+
+log() { printf '%s [config] %s\n' "$(date '+%F %T')" "$*" >> "${LOG_FILE}" ; }
+
+if [ ! -f "${CFG_FILE}" ]; then
+    printf '%s\n' "配置文件不存在，无法应用变更。请重新安装该应用。" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+    exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1 || [ ! -f "${PATCHER}" ]; then
+    printf '%s\n' "配置工具缺失，无法应用变更。请重新安装该应用。" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+    exit 1
+fi
+
+ARGS=(
+    "port=!${PORT}"
+    "listen=!true"
+    "listenAddress.ipv4=0.0.0.0"
+    "listenAddress.ipv6=[::]"
+    "protocol.ipv4=!true"
+    "protocol.ipv6=!${IPV6_ENABLED}"
+    "whitelistMode=!true"
+    "whitelist[]=127.0.0.1,::1,0.0.0.0/0,::/0"
+    "basicAuthMode=!false"
+)
+
+if ! node "${PATCHER}" "${CFG_FILE}" "${ARGS[@]}" >> "${LOG_FILE}" 2>&1; then
+    printf '%s\n' "运行配置写入失败，请查看日志：${LOG_FILE}" > "${TRIM_TEMP_LOGFILE:-/dev/null}"
+    exit 1
+fi
+log "配置已更新（port=${PORT}, listen=0.0.0.0, ipv6=on）"
+
+
+if [ "$(id -u)" = "0" ] && [ -n "${TRIM_UID:-}" ] && [ -n "${TRIM_GID:-}" ]; then
+    chown "${TRIM_UID}:${TRIM_GID}" "${CFG_FILE}" >> "${LOG_FILE}" 2>&1 || true
+fi
+
+# 重启服务，使新配置生效
+run_main() {
+    if [ "$(id -u)" = "0" ] && [ -n "${TRIM_USERNAME:-}" ] && command -v runuser >/dev/null 2>&1; then
+        runuser -u "${TRIM_USERNAME}" -- bash "${SELF_DIR}/main" "$1"
+    else
+        bash "${SELF_DIR}/main" "$1"
+    fi
+}
+
+log "重启服务以应用新配置（端口 ${PORT}）"
+run_main stop >> "${LOG_FILE}" 2>&1
+run_main start >> "${LOG_FILE}" 2>&1
+
+exit 0
